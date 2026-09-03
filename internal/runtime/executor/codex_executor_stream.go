@@ -141,8 +141,10 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	var param any
 	outputItemsByIndex := make(map[int64][]byte)
 	var outputItemsFallback [][]byte
+	semanticOutputSeen := false
 
 	var bufferedChunks [][]byte
+	bufferedEvents := 0
 	var initialChunks [][]byte
 	streamStarted := false
 	immediateTerminal := false
@@ -163,6 +165,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
 			translatedLine := bytes.Clone(line)
 			isHandshake := false
+			countsAsBufferedEvent := false
 			terminalSuccess := false
 
 			if transformed, ok := grokbuild.TransformKeepaliveSSELine(translatedLine, isGrokClient); ok {
@@ -174,6 +177,9 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 				observeCodexTokenEvent(reporter, data)
 				translatedLine = append([]byte("data: "), data...)
 				eventType := gjson.GetBytes(data, "type").String()
+				if codexStreamEventHasSemanticOutput(data) {
+					semanticOutputSeen = true
+				}
 				if streamErr, terminalBody, ok := codexTerminalFailureErr(data); ok {
 					closeBootstrapBody()
 					if errClearReplay := clearCodexReasoningReplayOnInvalidSignature(ctx, replayScope, streamErr.StatusCode(), terminalBody); errClearReplay != nil {
@@ -194,8 +200,9 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 					bootstrapTerminalErr = streamErr
 					break
 				}
-				if isCodexHandshakeMetadataEvent(eventType) {
+				if isCodexBootstrapMetadataEvent(data) {
 					isHandshake = true
+					countsAsBufferedEvent = true
 				}
 				switch eventType {
 				case "response.output_item.done":
@@ -203,13 +210,24 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 				case "response.completed", "response.incomplete", "response.done":
 					terminalSuccess = true
 					data = normalizeCodexWebsocketCompletion(data)
+					data = patchCodexCompletedOutput(data, outputItemsByIndex, outputItemsFallback)
+					if reason, empty := codexIsEmptyMaxOutputIncomplete(data, semanticOutputSeen || codexResponseHasSemanticOutput(data)); empty {
+						closeBootstrapBody()
+						streamErr := newCodexEmptyIncompleteError(reason)
+						helps.RecordAPIResponseError(ctx, e.cfg, streamErr)
+						if detail, ok := helps.ParseCodexUsage(data); ok {
+							reporter.PublishFailureWithDetail(ctx, detail, streamErr)
+						} else {
+							reporter.PublishFailure(ctx, streamErr)
+						}
+						return nil, streamErr
+					}
 					if detail, ok := helps.ParseCodexUsage(data); ok {
 						reporter.Publish(ctx, detail)
 					} else {
 						reporter.EnsurePublished(ctx)
 					}
 					publishCodexImageToolUsage(ctx, reporter, body, data)
-					data = patchCodexCompletedOutput(data, outputItemsByIndex, outputItemsFallback)
 					if eventType == "response.completed" || eventType == "response.done" {
 						cacheCodexReasoningReplayFromCompleted(replayScope, data)
 					}
@@ -222,8 +240,15 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 			translatedLine = applyCodexIdentityExposeResponsePayload(translatedLine, identityState)
 			chunks := helps.TranslateStreamWithClaudeInputTokens(ctx, to, responseFormat, req.Model, originalPayload, body, translatedLine, &param, claudeInputTokens)
 			if isHandshake && !terminalSuccess {
-				if len(bufferedChunks) < codexBootstrapMaxBufferedEvents {
+				// SSE framing lines (event: and the blank separator) belong to the
+				// buffered event but are not independent upstream events. Count only a
+				// parsed metadata data payload so the bound has transport-independent
+				// semantics.
+				if !countsAsBufferedEvent || bufferedEvents < codexBootstrapMaxBufferedEvents {
 					bufferedChunks = append(bufferedChunks, chunks...)
+					if countsAsBufferedEvent {
+						bufferedEvents++
+					}
 					continue
 				}
 				helps.LogWithRequestID(ctx).Debugf("codex executor: bootstrap buffer limit %d reached, releasing stream without overload probing", codexBootstrapMaxBufferedEvents)
@@ -304,6 +329,9 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 				observeCodexTokenEvent(reporter, data)
 				translatedLine = append([]byte("data: "), data...)
 				eventType := gjson.GetBytes(data, "type").String()
+				if codexStreamEventHasSemanticOutput(data) {
+					semanticOutputSeen = true
+				}
 				if streamErr, terminalBody, ok := codexTerminalFailureErr(data); ok {
 					if errClearReplay := clearCodexReasoningReplayOnInvalidSignature(ctx, replayScope, streamErr.StatusCode(), terminalBody); errClearReplay != nil {
 						helps.RecordAPIResponseError(ctx, e.cfg, errClearReplay)
@@ -328,13 +356,27 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 				case "response.completed", "response.incomplete", "response.done":
 					terminalSuccess = true
 					data = normalizeCodexWebsocketCompletion(data)
+					data = patchCodexCompletedOutput(data, outputItemsByIndex, outputItemsFallback)
+					if reason, empty := codexIsEmptyMaxOutputIncomplete(data, semanticOutputSeen || codexResponseHasSemanticOutput(data)); empty {
+						streamErr := newCodexEmptyIncompleteError(reason)
+						helps.RecordAPIResponseError(ctx, e.cfg, streamErr)
+						if detail, ok := helps.ParseCodexUsage(data); ok {
+							reporter.PublishFailureWithDetail(ctx, detail, streamErr)
+						} else {
+							reporter.PublishFailure(ctx, streamErr)
+						}
+						select {
+						case out <- cliproxyexecutor.StreamChunk{Err: streamErr}:
+						case <-ctx.Done():
+						}
+						return
+					}
 					if detail, ok := helps.ParseCodexUsage(data); ok {
 						reporter.Publish(ctx, detail)
 					} else {
 						reporter.EnsurePublished(ctx)
 					}
 					publishCodexImageToolUsage(ctx, reporter, body, data)
-					data = patchCodexCompletedOutput(data, outputItemsByIndex, outputItemsFallback)
 					if eventType == "response.completed" || eventType == "response.done" {
 						cacheCodexReasoningReplayFromCompleted(replayScope, data)
 					}
