@@ -327,6 +327,19 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 			collectCodexOutputItemDone(payload, outputItemsByIndex, &outputItemsFallback)
 		case "response.completed", "response.done", "response.incomplete":
 			payload = patchCodexCompletedOutput(payload, outputItemsByIndex, outputItemsFallback)
+			// Execute returns only the terminal non-stream payload. Earlier delta frames
+			// are not accumulated for the caller, so only reconstructed terminal output
+			// can make an incomplete response deliverable.
+			if reason, empty := codexIsEmptyMaxOutputIncomplete(payload, codexResponseHasSemanticOutput(payload)); empty {
+				err = newCodexEmptyIncompleteError(reason)
+				helps.RecordAPIWebsocketError(ctx, e.cfg, "empty_incomplete", err)
+				if detail, ok := helps.ParseCodexUsage(payload); ok {
+					reporter.PublishFailureWithDetail(ctx, detail, err)
+				} else {
+					reporter.PublishFailure(ctx, err)
+				}
+				return resp, err
+			}
 			if eventType != "response.incomplete" {
 				cacheCodexReasoningReplayFromCompleted(replayScope, payload)
 			}

@@ -17,11 +17,8 @@ func TestConvertCodexResponseToOpenAI_IncompleteTerminal(t *testing.T) {
 	if len(streamOut) != 1 {
 		t.Fatalf("expected 1 streaming terminal chunk, got %d", len(streamOut))
 	}
-	if got := gjson.GetBytes(streamOut[0], "choices.0.finish_reason").String(); got != "length" {
-		t.Fatalf("stream finish_reason = %q, want length; payload=%s", got, streamOut[0])
-	}
-	if got := gjson.GetBytes(streamOut[0], "choices.0.native_finish_reason").String(); got != "max_output_tokens" {
-		t.Fatalf("stream native_finish_reason = %q, want max_output_tokens; payload=%s", got, streamOut[0])
+	if got := gjson.GetBytes(streamOut[0], "error.type").String(); got != "upstream_incomplete" {
+		t.Fatalf("stream error.type = %q, want upstream_incomplete; payload=%s", got, streamOut[0])
 	}
 
 	var toolParam any
@@ -32,8 +29,87 @@ func TestConvertCodexResponseToOpenAI_IncompleteTerminal(t *testing.T) {
 	}
 
 	nonStreamOut := ConvertCodexResponseToOpenAINonStream(ctx, "gpt-5.5", nil, nil, terminal, nil)
-	if got := gjson.GetBytes(nonStreamOut, "choices.0.finish_reason").String(); got != "length" {
-		t.Fatalf("non-stream finish_reason = %q, want length; payload=%s", got, nonStreamOut)
+	if got := gjson.GetBytes(nonStreamOut, "error.type").String(); got != "upstream_incomplete" {
+		t.Fatalf("non-stream error.type = %q, want upstream_incomplete; payload=%s", got, nonStreamOut)
+	}
+
+	nonStreamWithText := []byte(`{"type":"response.incomplete","response":{"id":"resp_2","model":"gpt-5.5","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[{"type":"message","content":[{"type":"output_text","text":"partial answer"}]}]}}`)
+	nonStreamTextOut := ConvertCodexResponseToOpenAINonStream(ctx, "gpt-5.5", nil, nil, nonStreamWithText, nil)
+	if got := gjson.GetBytes(nonStreamTextOut, "choices.0.finish_reason").String(); got != "length" {
+		t.Fatalf("non-stream text finish_reason = %q, want length; payload=%s", got, nonStreamTextOut)
+	}
+}
+
+func TestConvertCodexResponseToOpenAI_ReasoningDoneWithoutDeltaIsSuppressed(t *testing.T) {
+	ctx := context.Background()
+	var param any
+	out := ConvertCodexResponseToOpenAI(ctx, "gpt-5.5", nil, nil, []byte(`data: {"type":"response.reasoning_text.done","text":""}`), &param)
+	if len(out) != 0 {
+		t.Fatalf("reasoning done without a semantic delta must be suppressed, got %s", out[0])
+	}
+}
+
+func TestConvertCodexResponseToOpenAI_IncompleteTerminalWithEmbeddedOutputRemainsLength(t *testing.T) {
+	ctx := context.Background()
+	var param any
+	terminal := []byte(`data: {"type":"response.incomplete","response":{"id":"resp_2","model":"gpt-5.5","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[{"type":"message","content":[{"type":"output_text","text":"partial answer"}]}]}}`)
+	out := ConvertCodexResponseToOpenAI(ctx, "gpt-5.5", nil, nil, terminal, &param)
+	if len(out) != 1 {
+		t.Fatalf("expected one terminal chunk, got %d", len(out))
+	}
+	if got := gjson.GetBytes(out[0], "choices.0.finish_reason").String(); got != "length" {
+		t.Fatalf("finish_reason = %q, want length; payload=%s", got, out[0])
+	}
+	if got := gjson.GetBytes(out[0], "choices.0.delta.content").String(); got != "partial answer" {
+		t.Fatalf("content = %q, want terminal partial answer; payload=%s", got, out[0])
+	}
+}
+
+func TestConvertCodexResponseToOpenAI_IncompleteTerminalWithStructuredOutputRemainsLength(t *testing.T) {
+	tests := []struct {
+		name      string
+		output    string
+		assertOut func(*testing.T, []byte)
+	}{
+		{
+			name:   "function call",
+			output: `[{"type":"function_call","call_id":"call_1","name":"lookup","arguments":"{\"q\":\"x\"}"}]`,
+			assertOut: func(t *testing.T, chunk []byte) {
+				if got := gjson.GetBytes(chunk, "choices.0.delta.tool_calls.0.function.name").String(); got != "lookup" {
+					t.Fatalf("tool name = %q, want lookup; payload=%s", got, chunk)
+				}
+				if got := gjson.GetBytes(chunk, "choices.0.delta.tool_calls.0.function.arguments").String(); got != `{"q":"x"}` {
+					t.Fatalf("tool arguments = %q; payload=%s", got, chunk)
+				}
+			},
+		},
+		{
+			name:   "image",
+			output: `[{"type":"image_generation_call","output_format":"png","result":"aGVsbG8="}]`,
+			assertOut: func(t *testing.T, chunk []byte) {
+				if got := gjson.GetBytes(chunk, "choices.0.delta.images.0.image_url.url").String(); got != "data:image/png;base64,aGVsbG8=" {
+					t.Fatalf("image URL = %q; payload=%s", got, chunk)
+				}
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			var param any
+			terminal := []byte(`data: {"type":"response.incomplete","response":{"id":"resp_structured","model":"gpt-5.5","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":` + tt.output + `}}`)
+			out := ConvertCodexResponseToOpenAI(ctx, "gpt-5.5", nil, nil, terminal, &param)
+			if len(out) != 1 {
+				t.Fatalf("expected one terminal chunk, got %d", len(out))
+			}
+			if got := gjson.GetBytes(out[0], "choices.0.finish_reason").String(); got != "length" {
+				t.Fatalf("finish_reason = %q, want length; payload=%s", got, out[0])
+			}
+			if gjson.GetBytes(out[0], "error").Exists() {
+				t.Fatalf("structured terminal output must not become an error: %s", out[0])
+			}
+			tt.assertOut(t, out[0])
+		})
 	}
 }
 

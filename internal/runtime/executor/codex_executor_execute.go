@@ -165,12 +165,19 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 			continue
 		}
 
-		if detail, ok := helps.ParseCodexUsage(eventData); ok {
+		completedData := patchCodexCompletedOutput(eventData, outputItemsByIndex, outputItemsFallback)
+		if reason, empty := codexIsEmptyMaxOutputIncomplete(completedData, codexResponseHasSemanticOutput(completedData)); empty {
+			err = newCodexEmptyIncompleteError(reason)
+			helps.RecordAPIResponseError(ctx, e.cfg, err)
+			if detail, ok := helps.ParseCodexUsage(completedData); ok {
+				reporter.PublishFailureWithDetail(ctx, detail, err)
+			}
+			return resp, err
+		}
+		if detail, ok := helps.ParseCodexUsage(completedData); ok {
 			reporter.Publish(ctx, detail)
 		}
-		publishCodexImageToolUsage(ctx, reporter, body, eventData)
-
-		completedData := patchCodexCompletedOutput(eventData, outputItemsByIndex, outputItemsFallback)
+		publishCodexImageToolUsage(ctx, reporter, body, completedData)
 		if eventType == "response.completed" {
 			cacheCodexReasoningReplayFromCompleted(replayScope, completedData)
 		}

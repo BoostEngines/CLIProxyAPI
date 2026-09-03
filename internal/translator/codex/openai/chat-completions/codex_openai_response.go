@@ -29,13 +29,15 @@ type toolCallStreamState struct {
 
 // ConvertCliToOpenAIParams holds parameters for response conversion.
 type ConvertCliToOpenAIParams struct {
-	ResponseID            string
-	CreatedAt             int64
-	Model                 string
-	FunctionCallIndex     int
-	toolCallStates        map[string]*toolCallStreamState
-	currentToolCall       *toolCallStreamState
-	LastImageHashByItemID map[string][32]byte
+	ResponseID             string
+	CreatedAt              int64
+	Model                  string
+	FunctionCallIndex      int
+	SemanticOutputEmitted  bool
+	ReasoningOutputEmitted bool
+	toolCallStates         map[string]*toolCallStreamState
+	currentToolCall        *toolCallStreamState
+	LastImageHashByItemID  map[string][32]byte
 }
 
 // ConvertCodexResponseToOpenAI translates a single chunk of a streaming response from the
@@ -125,14 +127,25 @@ func ConvertCodexResponseToOpenAI(_ context.Context, modelName string, originalR
 
 	if dataType == "response.reasoning_summary_text.delta" || dataType == "response.reasoning_text.delta" {
 		if deltaResult := rootResult.Get("delta"); deltaResult.Exists() {
+			if strings.TrimSpace(deltaResult.String()) != "" {
+				p := (*param).(*ConvertCliToOpenAIParams)
+				p.SemanticOutputEmitted = true
+				p.ReasoningOutputEmitted = true
+			}
 			template, _ = sjson.SetBytes(template, "choices.0.delta.role", "assistant")
 			template, _ = sjson.SetBytes(template, "choices.0.delta.reasoning_content", deltaResult.String())
 		}
 	} else if dataType == "response.reasoning_summary_text.done" || dataType == "response.reasoning_text.done" {
+		if !(*param).(*ConvertCliToOpenAIParams).ReasoningOutputEmitted {
+			return [][]byte{}
+		}
 		template, _ = sjson.SetBytes(template, "choices.0.delta.role", "assistant")
 		template, _ = sjson.SetBytes(template, "choices.0.delta.reasoning_content", "\n\n")
 	} else if dataType == "response.output_text.delta" {
 		if deltaResult := rootResult.Get("delta"); deltaResult.Exists() {
+			if strings.TrimSpace(deltaResult.String()) != "" {
+				(*param).(*ConvertCliToOpenAIParams).SemanticOutputEmitted = true
+			}
 			template, _ = sjson.SetBytes(template, "choices.0.delta.role", "assistant")
 			template, _ = sjson.SetBytes(template, "choices.0.delta.content", deltaResult.String())
 		}
@@ -169,6 +182,7 @@ func ConvertCodexResponseToOpenAI(_ context.Context, modelName string, originalR
 
 		template, _ = sjson.SetBytes(template, "choices.0.delta.role", "assistant")
 		template, _ = sjson.SetRawBytes(template, "choices.0.delta.images.-1", imagePayload)
+		(*param).(*ConvertCliToOpenAIParams).SemanticOutputEmitted = true
 	} else if dataType == "response.completed" || dataType == "response.incomplete" {
 		finishReason := "stop"
 		nativeFinishReason := finishReason
@@ -176,6 +190,28 @@ func ConvertCodexResponseToOpenAI(_ context.Context, modelName string, originalR
 			nativeFinishReason = rootResult.Get("response.incomplete_details.reason").String()
 			switch nativeFinishReason {
 			case "max_tokens", "max_output_tokens":
+				p := (*param).(*ConvertCliToOpenAIParams)
+				if !p.SemanticOutputEmitted {
+					content, reasoning := codexTerminalTextOutput(rootResult.Get("response"))
+					var structuredOutput bool
+					template, structuredOutput = appendCodexTerminalStructuredOutput(
+						template,
+						rootResult.Get("response"),
+						originalRequestRawJSON,
+						p,
+					)
+					if content == "" && reasoning == "" && !structuredOutput {
+						return [][]byte{codexEmptyIncompleteError(nativeFinishReason)}
+					}
+					template, _ = sjson.SetBytes(template, "choices.0.delta.role", "assistant")
+					if content != "" {
+						template, _ = sjson.SetBytes(template, "choices.0.delta.content", content)
+					}
+					if reasoning != "" {
+						template, _ = sjson.SetBytes(template, "choices.0.delta.reasoning_content", reasoning)
+					}
+					p.SemanticOutputEmitted = true
+				}
 				finishReason = "length"
 			case "content_filter":
 				finishReason = "content_filter"
@@ -195,6 +231,7 @@ func ConvertCodexResponseToOpenAI(_ context.Context, modelName string, originalR
 		// Increment index for this new tool call item.
 		p := (*param).(*ConvertCliToOpenAIParams)
 		p.FunctionCallIndex++
+		p.SemanticOutputEmitted = true
 		state := &toolCallStreamState{Index: p.FunctionCallIndex}
 		registerToolCallState(p, rootResult, itemResult, state)
 
@@ -295,6 +332,7 @@ func ConvertCodexResponseToOpenAI(_ context.Context, modelName string, originalR
 
 			template, _ = sjson.SetBytes(template, "choices.0.delta.role", "assistant")
 			template, _ = sjson.SetRawBytes(template, "choices.0.delta.images.-1", imagePayload)
+			(*param).(*ConvertCliToOpenAIParams).SemanticOutputEmitted = true
 			return [][]byte{template}
 		}
 		if !isCodexToolCallType(itemType) {
@@ -329,6 +367,7 @@ func ConvertCodexResponseToOpenAI(_ context.Context, modelName string, originalR
 
 		// Fallback path: model skipped output_item.added, so emit the complete tool call now.
 		p.FunctionCallIndex++
+		p.SemanticOutputEmitted = true
 		state = &toolCallStreamState{Index: p.FunctionCallIndex, ArgumentsEmitted: true, Done: true}
 		registerToolCallState(p, rootResult, itemResult, state)
 
@@ -357,6 +396,122 @@ func ConvertCodexResponseToOpenAI(_ context.Context, modelName string, originalR
 	return [][]byte{template}
 }
 
+func codexEmptyIncompleteError(reason string) []byte {
+	payload := []byte(`{"error":{"message":"Codex upstream returned response.incomplete before any semantic output","type":"upstream_incomplete","code":"","param":null}}`)
+	payload, _ = sjson.SetBytes(payload, "error.code", reason)
+	return payload
+}
+
+func codexTerminalTextOutput(response gjson.Result) (string, string) {
+	var content strings.Builder
+	var reasoning strings.Builder
+	for _, item := range response.Get("output").Array() {
+		switch item.Get("type").String() {
+		case "message":
+			for _, part := range item.Get("content").Array() {
+				content.WriteString(part.Get("text").String())
+			}
+		case "reasoning":
+			for _, part := range item.Get("summary").Array() {
+				reasoning.WriteString(part.Get("text").String())
+			}
+			for _, part := range item.Get("content").Array() {
+				reasoning.WriteString(part.Get("text").String())
+			}
+		}
+	}
+	return strings.TrimSpace(content.String()), strings.TrimSpace(reasoning.String())
+}
+
+func appendCodexTerminalStructuredOutput(
+	template []byte,
+	response gjson.Result,
+	originalRequestRawJSON []byte,
+	p *ConvertCliToOpenAIParams,
+) ([]byte, bool) {
+	var toolCalls [][]byte
+	var images [][]byte
+	reverseNames := buildReverseMapFromOriginalOpenAI(originalRequestRawJSON)
+
+	for _, item := range response.Get("output").Array() {
+		itemType := item.Get("type").String()
+		switch {
+		case isCodexToolCallType(itemType):
+			p.FunctionCallIndex++
+			toolCall := []byte(`{"index":0,"id":"","type":"function","function":{"name":"","arguments":""}}`)
+			toolCall, _ = sjson.SetBytes(toolCall, "index", p.FunctionCallIndex)
+			toolCall, _ = sjson.SetBytes(toolCall, "id", item.Get("call_id").String())
+			name := item.Get("name").String()
+			if original, ok := reverseNames[name]; ok {
+				name = original
+			}
+			toolCall, _ = sjson.SetBytes(toolCall, "function.name", name)
+			toolCall, _ = sjson.SetBytes(toolCall, "function.arguments", codexToolCallArguments(item))
+			toolCalls = append(toolCalls, toolCall)
+
+		case itemType == "image_generation_call":
+			b64 := item.Get("result").String()
+			if b64 == "" {
+				continue
+			}
+			imageURL := "data:" + mimeTypeFromCodexOutputFormat(item.Get("output_format").String()) + ";base64," + b64
+			image := []byte(`{"type":"image_url","image_url":{"url":""}}`)
+			image, _ = sjson.SetBytes(image, "index", len(images))
+			image, _ = sjson.SetBytes(image, "image_url.url", imageURL)
+			images = append(images, image)
+		}
+	}
+
+	if len(toolCalls) > 0 {
+		template, _ = sjson.SetRawBytes(template, "choices.0.delta.tool_calls", translatorcommon.JoinRawArray(toolCalls))
+	}
+	if len(images) > 0 {
+		template, _ = sjson.SetRawBytes(template, "choices.0.delta.images", translatorcommon.JoinRawArray(images))
+	}
+	if len(toolCalls) > 0 || len(images) > 0 {
+		template, _ = sjson.SetBytes(template, "choices.0.delta.role", "assistant")
+		return template, true
+	}
+	return template, false
+}
+
+func codexResponseHasSemanticOutput(response gjson.Result) bool {
+	output := response.Get("output")
+	if !output.IsArray() {
+		return false
+	}
+	for _, item := range output.Array() {
+		switch item.Get("type").String() {
+		case "message":
+			for _, content := range item.Get("content").Array() {
+				if strings.TrimSpace(content.Get("text").String()) != "" {
+					return true
+				}
+			}
+		case "reasoning":
+			for _, summary := range item.Get("summary").Array() {
+				if strings.TrimSpace(summary.Get("text").String()) != "" {
+					return true
+				}
+			}
+			for _, content := range item.Get("content").Array() {
+				if strings.TrimSpace(content.Get("text").String()) != "" {
+					return true
+				}
+			}
+		case "image_generation_call":
+			if item.Get("result").String() != "" {
+				return true
+			}
+		default:
+			if isCodexToolCallType(item.Get("type").String()) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // ConvertCodexResponseToOpenAINonStream converts a non-streaming Codex response to a non-streaming OpenAI response.
 // This function processes the complete Codex response and transforms it into a single OpenAI-compatible
 // JSON response. It handles message content, tool calls, reasoning content, and usage metadata, combining all
@@ -381,6 +536,12 @@ func ConvertCodexResponseToOpenAINonStream(_ context.Context, _ string, original
 	unixTimestamp := time.Now().Unix()
 
 	responseResult := rootResult.Get("response")
+	if responseType == "response.incomplete" {
+		reason := responseResult.Get("incomplete_details.reason").String()
+		if (reason == "max_tokens" || reason == "max_output_tokens") && !codexResponseHasSemanticOutput(responseResult) {
+			return codexEmptyIncompleteError(reason)
+		}
+	}
 
 	template := []byte(`{"id":"","object":"chat.completion","created":123456,"model":"model","choices":[{"index":0,"message":{"role":"assistant","content":null,"reasoning_content":null,"tool_calls":null},"finish_reason":null,"native_finish_reason":null}]}`)
 
