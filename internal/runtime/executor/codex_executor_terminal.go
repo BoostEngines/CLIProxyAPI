@@ -14,6 +14,7 @@ import (
 )
 
 const codexIncompleteStreamMessage = "stream error: stream disconnected before completion: stream closed before response.completed"
+const codexEmptyIncompleteMessage = "codex upstream returned response.incomplete before any semantic output"
 
 type codexIncompleteStreamError struct {
 	statusErr
@@ -28,6 +29,116 @@ func newCodexIncompleteStreamError() codexIncompleteStreamError {
 
 func (codexIncompleteStreamError) IsRequestScoped() bool {
 	return true
+}
+
+type codexEmptyIncompleteError struct {
+	statusErr
+}
+
+func newCodexEmptyIncompleteError(reason string) codexEmptyIncompleteError {
+	message := codexEmptyIncompleteMessage
+	if reason != "" {
+		message += ": " + reason
+	}
+	return codexEmptyIncompleteError{statusErr: statusErr{
+		code: http.StatusBadGateway,
+		msg:  message,
+	}}
+}
+
+func (codexEmptyIncompleteError) IsRequestScoped() bool {
+	return true
+}
+
+func codexIsEmptyMaxOutputIncomplete(eventData []byte, semanticOutputSeen bool) (string, bool) {
+	if semanticOutputSeen || gjson.GetBytes(eventData, "type").String() != "response.incomplete" {
+		return "", false
+	}
+	reason := gjson.GetBytes(eventData, "response.incomplete_details.reason").String()
+	return reason, reason == "max_tokens" || reason == "max_output_tokens"
+}
+
+func codexOutputItemHasSemanticOutput(item gjson.Result) bool {
+	switch item.Get("type").String() {
+	case "message":
+		for _, content := range item.Get("content").Array() {
+			if strings.TrimSpace(content.Get("text").String()) != "" ||
+				strings.TrimSpace(content.Get("refusal").String()) != "" ||
+				strings.TrimSpace(content.Get("audio.data").String()) != "" ||
+				strings.TrimSpace(content.Get("audio.transcript").String()) != "" {
+				return true
+			}
+		}
+	case "reasoning":
+		for _, summary := range item.Get("summary").Array() {
+			if strings.TrimSpace(summary.Get("text").String()) != "" {
+				return true
+			}
+		}
+		for _, content := range item.Get("content").Array() {
+			if strings.TrimSpace(content.Get("text").String()) != "" {
+				return true
+			}
+		}
+	case "function_call", "custom_tool_call", "mcp_call", "shell_call", "code_interpreter_call":
+		return true
+	case "image_generation_call":
+		return item.Get("result").String() != ""
+	}
+	return false
+}
+
+func codexStreamEventHasSemanticOutput(eventData []byte) bool {
+	eventType := gjson.GetBytes(eventData, "type").String()
+	switch eventType {
+	case "response.output_text.delta", "response.text.delta", "response.reasoning_summary_text.delta",
+		"response.reasoning.delta", "response.reasoning_text.delta", "response.function_call_arguments.delta",
+		"response.custom_tool_call_input.delta", "response.code_interpreter_call_code.delta",
+		"response.mcp_call_arguments.delta", "response.shell_call_command.delta", "response.refusal.delta",
+		"response.audio.transcript.delta":
+		return strings.TrimSpace(gjson.GetBytes(eventData, "delta").String()) != ""
+	case "response.audio.delta":
+		return gjson.GetBytes(eventData, "delta").String() != "" || gjson.GetBytes(eventData, "data").String() != ""
+	case "response.output_text.done", "response.reasoning_summary_text.done", "response.reasoning_text.done":
+		return strings.TrimSpace(gjson.GetBytes(eventData, "text").String()) != ""
+	case "response.refusal.done":
+		return strings.TrimSpace(gjson.GetBytes(eventData, "refusal").String()) != ""
+	case "response.function_call_arguments.done", "response.mcp_call_arguments.done":
+		return strings.TrimSpace(gjson.GetBytes(eventData, "arguments").String()) != ""
+	case "response.custom_tool_call_input.done":
+		return strings.TrimSpace(gjson.GetBytes(eventData, "input").String()) != ""
+	case "response.code_interpreter_call_code.done":
+		return strings.TrimSpace(gjson.GetBytes(eventData, "code").String()) != ""
+	case "response.shell_call_command.added", "response.shell_call_command.done":
+		return strings.TrimSpace(gjson.GetBytes(eventData, "command").String()) != ""
+	case "response.reasoning_summary_part.added", "response.reasoning_summary_part.done":
+		return strings.TrimSpace(gjson.GetBytes(eventData, "part.text").String()) != ""
+	case "response.content_part.added", "response.content_part.done":
+		return strings.TrimSpace(gjson.GetBytes(eventData, "part.text").String()) != "" ||
+			strings.TrimSpace(gjson.GetBytes(eventData, "part.refusal").String()) != "" ||
+			strings.TrimSpace(gjson.GetBytes(eventData, "part.audio.data").String()) != "" ||
+			strings.TrimSpace(gjson.GetBytes(eventData, "part.audio.transcript").String()) != "" ||
+			strings.TrimSpace(gjson.GetBytes(eventData, "part.data").String()) != "" ||
+			strings.TrimSpace(gjson.GetBytes(eventData, "part.transcript").String()) != ""
+	case "response.image_generation_call.partial_image":
+		return gjson.GetBytes(eventData, "partial_image_b64").String() != ""
+	case "response.output_item.added", "response.output_item.done":
+		return codexOutputItemHasSemanticOutput(gjson.GetBytes(eventData, "item"))
+	}
+	return false
+}
+
+func codexResponseHasSemanticOutput(eventData []byte) bool {
+	output := gjson.GetBytes(eventData, "response.output")
+	if !output.IsArray() {
+		return false
+	}
+	for _, item := range output.Array() {
+		if codexOutputItemHasSemanticOutput(item) {
+			return true
+		}
+	}
+	return false
 }
 
 // Streamed Codex responses may emit response.output_item.done events while leaving
@@ -414,14 +525,16 @@ func parseCodexRetryAfter(statusCode int, errorBody []byte, now time.Time) *time
 // limit is reached the stream is released and the original unbuffered semantics apply.
 const codexBootstrapMaxBufferedEvents = 16
 
-// isCodexHandshakeMetadataEvent reports whether an event carries no generated output and is
-// therefore safe to hold back before the downstream response headers are committed. Keeping a type
-// allow-list rather than a fixed event count matters for the websocket transport, where the
-// handshake frames arrive before response.created and would otherwise exhaust a small counter
-// before the rejection event is seen.
-func isCodexHandshakeMetadataEvent(eventType string) bool {
-	switch eventType {
-	case "response.created", "response.in_progress", "codex.rate_limits", "codex.response.metadata":
+// isCodexBootstrapMetadataEvent extends the fixed handshake allow-list with empty
+// lifecycle containers. These frames are common before the first text delta and are
+// safe to hold; populated tool/output items remain semantic and release immediately.
+func isCodexBootstrapMetadataEvent(eventData []byte) bool {
+	if codexStreamEventHasSemanticOutput(eventData) {
+		return false
+	}
+	switch gjson.GetBytes(eventData, "type").String() {
+	case "response.created", "response.in_progress", "codex.rate_limits", "codex.response.metadata",
+		"response.output_item.added", "response.content_part.added", "response.reasoning_summary_part.added":
 		return true
 	default:
 		return false

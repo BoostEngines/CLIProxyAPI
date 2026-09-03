@@ -278,8 +278,10 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	var param any
 	outputItemsByIndex := make(map[int64][]byte)
 	var outputItemsFallback [][]byte
+	semanticOutputSeen := false
 
 	var bufferedChunks [][]byte
+	bufferedEvents := 0
 	var initialChunks [][]byte
 	immediateTerminal := false
 	// bootstrapTerminalErr holds a non-overload terminal failure seen while buffering. It is
@@ -395,6 +397,9 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				bootstrapTerminalErr = streamErr
 				break
 			}
+			if codexStreamEventHasSemanticOutput(payload) {
+				semanticOutputSeen = true
+			}
 
 			eventType := gjson.GetBytes(payload, "type").String()
 			isTerminalEvent := eventType == "response.completed" || eventType == "response.done" || eventType == "response.incomplete" || eventType == "response.failed" || eventType == "error"
@@ -405,6 +410,24 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			if eventType == "response.completed" || eventType == "response.done" || eventType == "response.incomplete" {
 				completedPayload = normalizeCodexWebsocketCompletion(completedPayload)
 				completedPayload = patchCodexCompletedOutput(completedPayload, outputItemsByIndex, outputItemsFallback)
+				if reason, empty := codexIsEmptyMaxOutputIncomplete(completedPayload, semanticOutputSeen || codexResponseHasSemanticOutput(completedPayload)); empty {
+					emptyErr := newCodexEmptyIncompleteError(reason)
+					if sess != nil {
+						e.invalidateUpstreamConnWithoutDisconnectNotify(sess, conn, "empty_incomplete", emptyErr)
+						sess.clearActive(conn, readCh)
+						unlockStreamSession()
+					} else {
+						logCodexWebsocketDisconnected(executionSessionID, authID, wsURL, "empty_incomplete", emptyErr)
+						_ = closer.Close()
+					}
+					helps.RecordAPIWebsocketError(ctx, e.cfg, "empty_incomplete", emptyErr)
+					if detail, ok := helps.ParseCodexUsage(completedPayload); ok {
+						reporter.PublishFailureWithDetail(ctx, detail, emptyErr)
+					} else {
+						reporter.PublishFailure(ctx, emptyErr)
+					}
+					return nil, emptyErr
+				}
 				if eventType != "response.incomplete" {
 					cacheCodexReasoningReplayFromCompleted(replayScope, completedPayload)
 				}
@@ -433,9 +456,10 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				currentChunks = helps.TranslateStreamWithClaudeInputTokens(ctx, to, responseFormat, req.Model, originalPayload, clientBody, line, &param, claudeInputTokens)
 			}
 
-			if isCodexHandshakeMetadataEvent(eventType) && !isTerminalEvent {
-				if len(bufferedChunks) < codexBootstrapMaxBufferedEvents {
+			if isCodexBootstrapMetadataEvent(payload) && !isTerminalEvent {
+				if bufferedEvents < codexBootstrapMaxBufferedEvents {
 					bufferedChunks = append(bufferedChunks, currentChunks...)
+					bufferedEvents++
 					continue
 				}
 				helps.LogWithRequestID(ctx).Debugf("codex websockets executor: bootstrap buffer limit %d reached, releasing stream without overload probing", codexBootstrapMaxBufferedEvents)
@@ -597,6 +621,9 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				_ = send(cliproxyexecutor.StreamChunk{Err: streamErr})
 				return
 			}
+			if codexStreamEventHasSemanticOutput(payload) {
+				semanticOutputSeen = true
+			}
 
 			eventType := gjson.GetBytes(payload, "type").String()
 			isTerminalEvent := eventType == "response.completed" || eventType == "response.done" || eventType == "response.incomplete" || eventType == "response.failed" || eventType == "error"
@@ -607,6 +634,19 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			if eventType == "response.completed" || eventType == "response.done" || eventType == "response.incomplete" {
 				completedPayload = normalizeCodexWebsocketCompletion(completedPayload)
 				completedPayload = patchCodexCompletedOutput(completedPayload, outputItemsByIndex, outputItemsFallback)
+				if reason, empty := codexIsEmptyMaxOutputIncomplete(completedPayload, semanticOutputSeen || codexResponseHasSemanticOutput(completedPayload)); empty {
+					emptyErr := newCodexEmptyIncompleteError(reason)
+					terminateReason = "empty_incomplete"
+					terminateErr = emptyErr
+					helps.RecordAPIWebsocketError(ctx, e.cfg, terminateReason, emptyErr)
+					if detail, ok := helps.ParseCodexUsage(completedPayload); ok {
+						reporter.PublishFailureWithDetail(ctx, detail, emptyErr)
+					} else {
+						reporter.PublishFailure(ctx, emptyErr)
+					}
+					_ = send(cliproxyexecutor.StreamChunk{Err: emptyErr})
+					return
+				}
 				if eventType != "response.incomplete" {
 					cacheCodexReasoningReplayFromCompleted(replayScope, completedPayload)
 				}

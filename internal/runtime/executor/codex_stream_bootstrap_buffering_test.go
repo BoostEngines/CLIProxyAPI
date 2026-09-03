@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
@@ -180,6 +181,76 @@ func TestCodexExecutor_BootstrapBuffering_BufferLimitReleasesStream(t *testing.T
 	}
 }
 
+// The bootstrap bound is expressed in upstream events, not scanner lines. A normal SSE event
+// occupies event/data/blank lines, so fifteen lifecycle events must still leave room for a
+// terminal overload to be detected before any downstream chunk is committed.
+func TestCodexExecutor_BootstrapBuffering_CountsDataEventsNotSSELines(t *testing.T) {
+	events := make([]string, 0, codexBootstrapMaxBufferedEvents)
+	for i := 0; i < codexBootstrapMaxBufferedEvents-1; i++ {
+		events = append(events, fmt.Sprintf(`{"type":"response.in_progress","response":{"id":"resp_%d"}}`, i))
+	}
+	events = append(events, codexOverloadEvent)
+	server := codexSSEServer(events...)
+	defer server.Close()
+
+	req, opts := codexTestRequest()
+	result, err := NewCodexExecutor(codexBufferingConfig(true)).ExecuteStream(context.Background(), codexTestAuth(server.URL), req, opts)
+	if err == nil {
+		t.Fatal("expected overload to fail before the sixteen-event window is exhausted")
+	}
+	if result != nil {
+		t.Fatal("expected nil result because no SSE event should have been committed")
+	}
+	if got := statusCodeFromTestError(t, err); got != http.StatusServiceUnavailable {
+		t.Fatalf("status code = %d, want %d", got, http.StatusServiceUnavailable)
+	}
+}
+
+func TestCodexBootstrapMetadataEvent_PopulatedAddedPartsAreSemantic(t *testing.T) {
+	tests := []string{
+		`{"type":"response.content_part.added","part":{"type":"output_text","text":"partial"}}`,
+		`{"type":"response.content_part.added","part":{"type":"refusal","refusal":"cannot comply"}}`,
+		`{"type":"response.content_part.added","part":{"type":"output_audio","audio":{"data":"YWJj"}}}`,
+		`{"type":"response.reasoning_summary_part.added","part":{"type":"summary_text","text":"thinking"}}`,
+	}
+	for _, event := range tests {
+		if !codexStreamEventHasSemanticOutput([]byte(event)) {
+			t.Fatalf("populated added event must be semantic: %s", event)
+		}
+		if isCodexBootstrapMetadataEvent([]byte(event)) {
+			t.Fatalf("populated added event must release bootstrap buffering: %s", event)
+		}
+	}
+}
+
+func TestCodexWebsocketsExecute_EmptyTerminalAfterDeltaFailsForNonStreamFormats(t *testing.T) {
+	delta := `{"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"partial"}`
+	emptyIncomplete := `{"type":"response.incomplete","response":{"id":"resp_1","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[],"usage":{"input_tokens":10,"output_tokens":1,"total_tokens":11}}}`
+	tests := []struct {
+		name   string
+		format sdktranslator.Format
+		body   string
+	}{
+		{name: "responses", format: sdktranslator.FromString("openai-response"), body: `{"model":"gpt-5.6-terra","input":"hello"}`},
+		{name: "chat", format: sdktranslator.FromString("openai"), body: `{"model":"gpt-5.6-terra","messages":[{"role":"user","content":"hello"}]}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := codexWebsocketServer(t, delta, emptyIncomplete)
+			defer server.Close()
+			req := cliproxyexecutor.Request{Model: "gpt-5.6-terra", Payload: []byte(tt.body)}
+			opts := cliproxyexecutor.Options{SourceFormat: tt.format, ResponseFormat: tt.format}
+			resp, err := NewCodexWebsocketsExecutor(&config.Config{}).Execute(context.Background(), codexTestAuth(server.URL), req, opts)
+			if err == nil {
+				t.Fatalf("expected empty terminal response to fail; payload=%s", resp.Payload)
+			}
+			if got := statusCodeFromTestError(t, err); got != http.StatusBadGateway {
+				t.Fatalf("status code = %d, want %d; err=%v", got, http.StatusBadGateway, err)
+			}
+		})
+	}
+}
+
 // Buffered handshake events must be replayed in upstream order ahead of the first generated event.
 func TestCodexExecutor_BootstrapBuffering_FlushesInOrderOnFirstOutput(t *testing.T) {
 	server := codexSSEServer(codexCreatedEvent, codexInProgressEvent, codexOutputAddedEvent, codexCompletedEventBody)
@@ -293,6 +364,42 @@ func TestCodexWebsocketsExecutor_BootstrapBuffering_PrivateHandshakeFramesDoNotE
 	}
 	if got := statusCodeFromTestError(t, err); got != http.StatusServiceUnavailable {
 		t.Fatalf("status code = %d, want %d", got, http.StatusServiceUnavailable)
+	}
+}
+
+func TestCodexWebsocketsExecutor_EmptyIncompleteReleasesExecutionSession(t *testing.T) {
+	emptyOutputAdded := `{"type":"response.output_item.added","output_index":0,"item":{"id":"msg_1","type":"message","role":"assistant","content":[]}}`
+	emptyContentPart := `{"type":"response.content_part.added","output_index":0,"content_index":0,"part":{"type":"output_text","text":""}}`
+	emptyIncomplete := `{"type":"response.incomplete","response":{"id":"resp_1","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[],"usage":{"input_tokens":10,"output_tokens":1,"total_tokens":11}}}`
+	server := codexWebsocketServerHoldingConnection(t, codexCreatedEvent, emptyOutputAdded, emptyContentPart, emptyIncomplete)
+	defer server.Close()
+
+	exec := NewCodexWebsocketsExecutor(codexBufferingConfig(true))
+	exec.store = &codexWebsocketSessionStore{sessions: make(map[string]*codexWebsocketSession)}
+	const sessionID = "empty-incomplete-session"
+	t.Cleanup(func() { exec.CloseExecutionSession(sessionID) })
+
+	req, opts := codexWebsocketRequest()
+	opts.Metadata = map[string]any{cliproxyexecutor.ExecutionSessionMetadataKey: sessionID}
+	call := func() error {
+		_, err := exec.ExecuteStream(context.Background(), codexTestAuth(server.URL), req, opts)
+		return err
+	}
+
+	for attempt := 1; attempt <= 2; attempt++ {
+		done := make(chan error, 1)
+		go func() { done <- call() }()
+		select {
+		case err := <-done:
+			if err == nil {
+				t.Fatalf("attempt %d returned nil error", attempt)
+			}
+			if got := statusCodeFromTestError(t, err); got != http.StatusBadGateway {
+				t.Fatalf("attempt %d status = %d, want %d; err=%v", attempt, got, http.StatusBadGateway, err)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatalf("attempt %d timed out; execution session lock or websocket was not released", attempt)
+		}
 	}
 }
 
