@@ -713,3 +713,94 @@ func TestConvertCodexResponseToOpenAI_NonStreamReasoningSummaryAndContent(t *tes
 		t.Fatalf("expected reasoning_content %q, got %q; payload=%s", "Summary part and Content part", got.String(), string(out))
 	}
 }
+
+func TestConvertCodexResponseToOpenAI_CommentaryPhaseNeverBecomesContent(t *testing.T) {
+	ctx := context.Background()
+	var param any
+
+	added := []byte(`data: {"type":"response.output_item.added","output_index":0,"item":{"id":"msg_commentary","type":"message","phase":"commentary"}}`)
+	if out := ConvertCodexResponseToOpenAI(ctx, "gpt-5.6-sol", nil, nil, added, &param); len(out) != 0 {
+		t.Fatalf("message announcement should not emit a chat chunk: %s", out[0])
+	}
+
+	delta := []byte(`data: {"type":"response.output_text.delta","item_id":"msg_commentary","output_index":0,"delta":"I'll inspect the repository."}`)
+	out := ConvertCodexResponseToOpenAI(ctx, "gpt-5.6-sol", nil, nil, delta, &param)
+	if len(out) != 1 {
+		t.Fatalf("expected one translated commentary chunk, got %d", len(out))
+	}
+	if gjson.GetBytes(out[0], "choices.0.delta.content").Exists() {
+		t.Fatalf("commentary must never be translated as visible content: %s", out[0])
+	}
+	if got := gjson.GetBytes(out[0], "choices.0.delta.reasoning_content").String(); got != "I'll inspect the repository." {
+		t.Fatalf("reasoning_content = %q; payload=%s", got, out[0])
+	}
+}
+
+func TestConvertCodexResponseToOpenAI_FinalAnswerPhaseBecomesContent(t *testing.T) {
+	ctx := context.Background()
+	var param any
+
+	_ = ConvertCodexResponseToOpenAI(ctx, "gpt-5.6-sol", nil, nil, []byte(`data: {"type":"response.output_item.added","output_index":1,"item":{"id":"msg_final","type":"message","phase":"final_answer"}}`), &param)
+	out := ConvertCodexResponseToOpenAI(ctx, "gpt-5.6-sol", nil, nil, []byte(`data: {"type":"response.output_text.delta","item_id":"msg_final","output_index":1,"delta":"The final answer."}`), &param)
+
+	if len(out) != 1 {
+		t.Fatalf("expected one translated final chunk, got %d", len(out))
+	}
+	if got := gjson.GetBytes(out[0], "choices.0.delta.content").String(); got != "The final answer." {
+		t.Fatalf("content = %q; payload=%s", got, out[0])
+	}
+	if gjson.GetBytes(out[0], "choices.0.delta.reasoning_content").Exists() {
+		t.Fatalf("final answer must not be translated as reasoning: %s", out[0])
+	}
+}
+
+func TestConvertCodexResponseToOpenAI_UnphasedTextFailsClosedAfterPhaseObserved(t *testing.T) {
+	ctx := context.Background()
+	var param any
+
+	_ = ConvertCodexResponseToOpenAI(ctx, "gpt-5.6-sol", nil, nil, []byte(`data: {"type":"response.output_item.added","output_index":0,"item":{"id":"msg_commentary","type":"message","phase":"commentary"}}`), &param)
+	_ = ConvertCodexResponseToOpenAI(ctx, "gpt-5.6-sol", nil, nil, []byte(`data: {"type":"response.output_item.added","output_index":1,"item":{"id":"msg_unphased","type":"message"}}`), &param)
+	out := ConvertCodexResponseToOpenAI(ctx, "gpt-5.6-sol", nil, nil, []byte(`data: {"type":"response.output_text.delta","item_id":"msg_unphased","output_index":1,"delta":"must stay hidden"}`), &param)
+
+	if len(out) != 1 {
+		t.Fatalf("expected one translated chunk, got %d", len(out))
+	}
+	if gjson.GetBytes(out[0], "choices.0.delta.content").Exists() {
+		t.Fatalf("unphased text after a phase contract must not become content: %s", out[0])
+	}
+	if got := gjson.GetBytes(out[0], "choices.0.delta.reasoning_content").String(); got != "must stay hidden" {
+		t.Fatalf("reasoning_content = %q; payload=%s", got, out[0])
+	}
+}
+
+func TestConvertCodexResponseToOpenAINonStream_SeparatesCommentaryAndFinalAnswer(t *testing.T) {
+	ctx := context.Background()
+	raw := []byte(`{"type":"response.completed","response":{"id":"resp_phase","created_at":1700000000,"model":"gpt-5.6-sol","status":"completed","output":[` +
+		`{"type":"message","phase":"commentary","content":[{"type":"output_text","text":"I'll use the tool."}]},` +
+		`{"type":"message","phase":"final_answer","content":[{"type":"output_text","text":"Done."}]}` +
+		`]}}`)
+	out := ConvertCodexResponseToOpenAINonStream(ctx, "gpt-5.6-sol", nil, nil, raw, nil)
+
+	if got := gjson.GetBytes(out, "choices.0.message.content").String(); got != "Done." {
+		t.Fatalf("content = %q; payload=%s", got, out)
+	}
+	if got := gjson.GetBytes(out, "choices.0.message.reasoning_content").String(); got != "I'll use the tool." {
+		t.Fatalf("reasoning_content = %q; payload=%s", got, out)
+	}
+}
+
+func TestConvertCodexResponseToOpenAINonStream_UnphasedTextFailsClosedWhenAnyPhaseExists(t *testing.T) {
+	ctx := context.Background()
+	raw := []byte(`{"type":"response.completed","response":{"id":"resp_phase","created_at":1700000000,"model":"gpt-5.6-sol","status":"completed","output":[` +
+		`{"type":"message","phase":"commentary","content":[{"type":"output_text","text":"Checking."}]},` +
+		`{"type":"message","content":[{"type":"output_text","text":"must stay hidden"}]}` +
+		`]}}`)
+	out := ConvertCodexResponseToOpenAINonStream(ctx, "gpt-5.6-sol", nil, nil, raw, nil)
+
+	if gjson.GetBytes(out, "choices.0.message.content").String() != "" {
+		t.Fatalf("unphased text after a phase contract must not become content: %s", out)
+	}
+	if got := gjson.GetBytes(out, "choices.0.message.reasoning_content").String(); got != "Checking.must stay hidden" {
+		t.Fatalf("reasoning_content = %q; payload=%s", got, out)
+	}
+}
