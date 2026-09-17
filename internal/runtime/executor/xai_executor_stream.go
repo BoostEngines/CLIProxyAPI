@@ -110,6 +110,7 @@ func (e *XAIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth
 				eventDataList := xaiNormalizeReasoningSummaryDataEvents(bytes.TrimSpace(line[len(xaiDataTag):]))
 				hasPendingEventLine := pendingEventLine != nil
 				for i, eventData := range eventDataList {
+					eventData = helps.RestoreXAIClientWebSearch(eventData, prepared.clientWebSearchAlias)
 					eventData = namespaceRestorer.restore(eventData)
 					eventData = responseFilter.apply(eventData)
 					if len(eventData) == 0 {
@@ -123,10 +124,21 @@ func (e *XAIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth
 					case "response.output_item.done":
 						xaiCollectOutputItemDone(eventData, outputItemsByIndex, &outputItemsFallback)
 					case "response.completed", "response.incomplete":
-						if detail, ok := helps.ParseCodexUsage(eventData); ok {
+						detail, hasUsage := helps.ParseCodexUsage(eventData)
+						var errCompleted error
+						eventData, errCompleted = xaiPatchCompletedOutput(eventData, outputItemsByIndex, outputItemsFallback)
+						if errCompleted != nil {
+							helps.RecordAPIResponseError(ctx, e.cfg, errCompleted)
+							reporter.PublishFailureWithDetail(ctx, detail, errCompleted)
+							select {
+							case out <- cliproxyexecutor.StreamChunk{Err: errCompleted}:
+							case <-ctx.Done():
+							}
+							return
+						}
+						if hasUsage {
 							reporter.Publish(ctx, detail)
 						}
-						eventData = xaiPatchCompletedOutput(eventData, outputItemsByIndex, outputItemsFallback)
 						eventData = xaiNormalizeReasoningSummaryData(eventData)
 						if normalizedEventName == "response.completed" {
 							// A truncated turn carries no replayable terminal state, so only a

@@ -966,8 +966,11 @@ func TestXAIExecutorPrepareHonorsInjectXSearchConfig(t *testing.T) {
 			if len(tools) != 1+wantXSearchCount {
 				t.Fatalf("tools length = %d, want %d; body=%s", len(tools), 1+wantXSearchCount, prepared.body)
 			}
-			if got := tools[0].Get("name").String(); got != "web_search" {
-				t.Fatalf("client web_search tool missing; body=%s", prepared.body)
+			if got := tools[0].Get("name").String(); got != "operax_web_search" || prepared.clientWebSearchAlias != got {
+				t.Fatalf("client web_search alias missing; body=%s", prepared.body)
+			}
+			if got := gjson.GetBytes(prepared.body, "tool_choice.tools.0.name").String(); got != prepared.clientWebSearchAlias {
+				t.Fatalf("allowed client tool does not match alias; body=%s", prepared.body)
 			}
 			xSearchTools := 0
 			for _, tool := range tools {
@@ -6128,7 +6131,10 @@ func TestXAIPatchCompletedOutput_EnsuresUsageDetails(t *testing.T) {
 	outputItemsByIndex := make(map[int64][]byte)
 	var outputItemsFallback [][]byte
 
-	got := xaiPatchCompletedOutput(eventData, outputItemsByIndex, outputItemsFallback)
+	got, err := xaiPatchCompletedOutput(eventData, outputItemsByIndex, outputItemsFallback)
+	if err != nil {
+		t.Fatalf("xaiPatchCompletedOutput() error = %v", err)
+	}
 	if !gjson.GetBytes(got, "response.usage.output_tokens_details").Exists() {
 		t.Fatalf("expected output_tokens_details to exist, got %s", string(got))
 	}
