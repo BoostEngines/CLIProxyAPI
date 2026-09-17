@@ -90,6 +90,7 @@ func (e *XAIExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req 
 			continue
 		}
 		eventData := xaiNormalizeReasoningSummaryData(bytes.TrimSpace(line[len(xaiDataTag):]))
+		eventData = helps.RestoreXAIClientWebSearch(eventData, prepared.clientWebSearchAlias)
 		eventData = namespaceRestorer.restore(eventData)
 		eventData = responseFilter.apply(eventData)
 		if len(eventData) == 0 {
@@ -100,10 +101,16 @@ func (e *XAIExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req 
 		case "response.output_item.done":
 			xaiCollectOutputItemDone(eventData, outputItemsByIndex, &outputItemsFallback)
 		case "response.completed", "response.incomplete":
-			if detail, ok := helps.ParseCodexUsage(eventData); ok {
+			detail, hasUsage := helps.ParseCodexUsage(eventData)
+			completedData, errCompleted := xaiPatchCompletedOutput(eventData, outputItemsByIndex, outputItemsFallback)
+			if errCompleted != nil {
+				helps.RecordAPIResponseError(ctx, e.cfg, errCompleted)
+				reporter.PublishFailureWithDetail(ctx, detail, errCompleted)
+				return resp, errCompleted
+			}
+			if hasUsage {
 				reporter.Publish(ctx, detail)
 			}
-			completedData := xaiPatchCompletedOutput(eventData, outputItemsByIndex, outputItemsFallback)
 			completedData = xaiNormalizeReasoningSummaryData(completedData)
 			if eventType == "response.completed" {
 				// A truncated turn carries no replayable terminal state, so only a

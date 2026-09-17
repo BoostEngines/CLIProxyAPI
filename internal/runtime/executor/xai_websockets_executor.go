@@ -763,6 +763,7 @@ func (e *XAIWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *cliprox
 			}
 
 			for _, payload := range xaiNormalizeReasoningSummaryDataEvents(payload) {
+				payload = helps.RestoreXAIClientWebSearch(payload, prepared.clientWebSearchAlias)
 				payload = namespaceRestorer.restore(payload)
 				payload = responseFilter.apply(payload)
 				if len(payload) == 0 {
@@ -785,10 +786,23 @@ func (e *XAIWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *cliprox
 					xaiCollectOutputItemDone(payload, outputItemsByIndex, &outputItemsFallback)
 				case "response.completed":
 					logXAIWebsocketTerminalResponse(executionSessionID, authID, wsURL, eventType, payload)
-					if detail, ok := helps.ParseCodexUsage(payload); ok {
+					detail, hasUsage := helps.ParseCodexUsage(payload)
+					var errCompleted error
+					payload, errCompleted = xaiPatchCompletedOutput(payload, outputItemsByIndex, outputItemsFallback)
+					if errCompleted != nil {
+						terminateReason = "incomplete_web_search"
+						terminateErr = errCompleted
+						helps.RecordAPIWebsocketError(ctx, e.cfg, terminateReason, errCompleted)
+						reporter.PublishFailureWithDetail(ctx, detail, errCompleted)
+						if sess != nil {
+							e.invalidateUpstreamConnWithoutDisconnectNotify(sess, conn, terminateReason, errCompleted)
+						}
+						_ = send(cliproxyexecutor.StreamChunk{Err: errCompleted})
+						return
+					}
+					if hasUsage {
 						reporter.Publish(ctx, detail)
 					}
-					payload = xaiPatchCompletedOutput(payload, outputItemsByIndex, outputItemsFallback)
 					payload = xaiNormalizeReasoningSummaryData(payload)
 					cacheXAIReasoningReplayFromCompleted(ctx, prepared.replayScope, payload)
 					if !warmupRequest && idMapper != nil && idMapper.state != nil && !recordedTranscript {

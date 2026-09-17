@@ -996,12 +996,15 @@ func xaiCollectOutputItemDone(eventData []byte, outputItemsByIndex map[int64][]b
 	*outputItemsFallback = append(*outputItemsFallback, []byte(itemResult.Raw))
 }
 
-func xaiPatchCompletedOutput(eventData []byte, outputItemsByIndex map[int64][]byte, outputItemsFallback [][]byte) []byte {
+func xaiPatchCompletedOutput(eventData []byte, outputItemsByIndex map[int64][]byte, outputItemsFallback [][]byte) ([]byte, error) {
+	if helps.XAIHasUnfinishedWebSearch(eventData) {
+		return nil, statusErr{code: http.StatusBadGateway, msg: `{"error":{"type":"upstream_error","code":"incomplete_web_search","message":"xAI completed the response with unfinished web searches"}}`}
+	}
 	eventData = helps.EnsureResponsesUsageDetails(eventData)
 	outputResult := gjson.GetBytes(eventData, "response.output")
 	shouldPatchOutput := (!outputResult.Exists() || !outputResult.IsArray() || len(outputResult.Array()) == 0) && (len(outputItemsByIndex) > 0 || len(outputItemsFallback) > 0)
 	if !shouldPatchOutput {
-		return eventData
+		return eventData, nil
 	}
 
 	indexes := make([]int64, 0, len(outputItemsByIndex))
@@ -1036,7 +1039,7 @@ func xaiPatchCompletedOutput(eventData []byte, outputItemsByIndex map[int64][]by
 	}
 
 	patched, _ := sjson.SetRawBytes(eventData, "response.output", outputArray)
-	return patched
+	return patched, nil
 }
 
 // xaiFreeUsageExhaustedCooldown is the free-tier rolling window advertised by
