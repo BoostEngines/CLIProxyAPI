@@ -29,15 +29,19 @@ type toolCallStreamState struct {
 
 // ConvertCliToOpenAIParams holds parameters for response conversion.
 type ConvertCliToOpenAIParams struct {
-	ResponseID             string
-	CreatedAt              int64
-	Model                  string
-	FunctionCallIndex      int
-	SemanticOutputEmitted  bool
-	ReasoningOutputEmitted bool
-	toolCallStates         map[string]*toolCallStreamState
-	currentToolCall        *toolCallStreamState
-	LastImageHashByItemID  map[string][32]byte
+	ResponseID              string
+	CreatedAt               int64
+	Model                   string
+	FunctionCallIndex       int
+	SemanticOutputEmitted   bool
+	ReasoningOutputEmitted  bool
+	ActiveMessagePhase      string
+	SawExplicitMessagePhase bool
+	MessagePhaseByItemID    map[string]string
+	MessagePhaseByIndex     map[int64]string
+	toolCallStates          map[string]*toolCallStreamState
+	currentToolCall         *toolCallStreamState
+	LastImageHashByItemID   map[string][32]byte
 }
 
 // ConvertCodexResponseToOpenAI translates a single chunk of a streaming response from the
@@ -61,6 +65,8 @@ func ConvertCodexResponseToOpenAI(_ context.Context, modelName string, originalR
 			CreatedAt:             0,
 			ResponseID:            "",
 			FunctionCallIndex:     -1,
+			MessagePhaseByItemID:  make(map[string]string),
+			MessagePhaseByIndex:   make(map[int64]string),
 			toolCallStates:        make(map[string]*toolCallStreamState),
 			LastImageHashByItemID: make(map[string][32]byte),
 		}
@@ -143,11 +149,17 @@ func ConvertCodexResponseToOpenAI(_ context.Context, modelName string, originalR
 		template, _ = sjson.SetBytes(template, "choices.0.delta.reasoning_content", "\n\n")
 	} else if dataType == "response.output_text.delta" {
 		if deltaResult := rootResult.Get("delta"); deltaResult.Exists() {
+			p := (*param).(*ConvertCliToOpenAIParams)
 			if strings.TrimSpace(deltaResult.String()) != "" {
-				(*param).(*ConvertCliToOpenAIParams).SemanticOutputEmitted = true
+				p.SemanticOutputEmitted = true
 			}
 			template, _ = sjson.SetBytes(template, "choices.0.delta.role", "assistant")
-			template, _ = sjson.SetBytes(template, "choices.0.delta.content", deltaResult.String())
+			if codexMessagePhaseIsInterim(codexStreamMessagePhase(rootResult, p)) {
+				p.ReasoningOutputEmitted = true
+				template, _ = sjson.SetBytes(template, "choices.0.delta.reasoning_content", deltaResult.String())
+			} else {
+				template, _ = sjson.SetBytes(template, "choices.0.delta.content", deltaResult.String())
+			}
 		}
 	} else if dataType == "response.image_generation_call.partial_image" {
 		itemID := rootResult.Get("item_id").String()
@@ -224,12 +236,17 @@ func ConvertCodexResponseToOpenAI(_ context.Context, modelName string, originalR
 		template, _ = sjson.SetBytes(template, "choices.0.native_finish_reason", nativeFinishReason)
 	} else if dataType == "response.output_item.added" {
 		itemResult := rootResult.Get("item")
+		p := (*param).(*ConvertCliToOpenAIParams)
+		if itemResult.Exists() && itemResult.Get("type").String() == "message" {
+			rememberCodexMessagePhase(rootResult, itemResult, p)
+			return [][]byte{}
+		}
+		p.ActiveMessagePhase = ""
 		if !itemResult.Exists() || !isCodexToolCallType(itemResult.Get("type").String()) {
 			return [][]byte{}
 		}
 
 		// Increment index for this new tool call item.
-		p := (*param).(*ConvertCliToOpenAIParams)
 		p.FunctionCallIndex++
 		p.SemanticOutputEmitted = true
 		state := &toolCallStreamState{Index: p.FunctionCallIndex}
@@ -299,6 +316,10 @@ func ConvertCodexResponseToOpenAI(_ context.Context, modelName string, originalR
 			return [][]byte{}
 		}
 		itemType := itemResult.Get("type").String()
+		if itemType == "message" {
+			rememberCodexMessagePhase(rootResult, itemResult, (*param).(*ConvertCliToOpenAIParams))
+			return [][]byte{}
+		}
 		if itemType == "image_generation_call" {
 			itemID := itemResult.Get("id").String()
 			b64 := itemResult.Get("result").String()
@@ -402,14 +423,92 @@ func codexEmptyIncompleteError(reason string) []byte {
 	return payload
 }
 
+func normalizeCodexMessagePhase(phase string) string {
+	return strings.ToLower(strings.TrimSpace(phase))
+}
+
+// codexMessagePhaseIsInterim treats every explicit non-final message phase as
+// non-answer text. This is deliberately fail-closed: a future Codex phase must
+// not silently become visible Chat Completions content merely because this
+// compatibility translator has not learned its name yet.
+func codexMessagePhaseIsInterim(phase string) bool {
+	phase = normalizeCodexMessagePhase(phase)
+	return phase != "" && phase != "final_answer" && phase != "final"
+}
+
+func rememberCodexMessagePhase(root, item gjson.Result, p *ConvertCliToOpenAIParams) {
+	if p == nil {
+		return
+	}
+	phase := normalizeCodexMessagePhase(item.Get("phase").String())
+	if phase != "" {
+		p.SawExplicitMessagePhase = true
+	}
+	p.ActiveMessagePhase = phase
+	if p.MessagePhaseByItemID == nil {
+		p.MessagePhaseByItemID = make(map[string]string)
+	}
+	if p.MessagePhaseByIndex == nil {
+		p.MessagePhaseByIndex = make(map[int64]string)
+	}
+	if itemID := item.Get("id"); itemID.Exists() && itemID.String() != "" {
+		p.MessagePhaseByItemID[itemID.String()] = phase
+	}
+	if outputIndex := root.Get("output_index"); outputIndex.Exists() {
+		p.MessagePhaseByIndex[outputIndex.Int()] = phase
+	}
+}
+
+func codexStreamMessagePhase(root gjson.Result, p *ConvertCliToOpenAIParams) string {
+	if p == nil {
+		return ""
+	}
+	if phase := normalizeCodexMessagePhase(root.Get("phase").String()); phase != "" {
+		return phase
+	}
+	if itemID := root.Get("item_id"); itemID.Exists() && itemID.String() != "" {
+		if phase, ok := p.MessagePhaseByItemID[itemID.String()]; ok && phase != "" {
+			return phase
+		}
+	}
+	if outputIndex := root.Get("output_index"); outputIndex.Exists() {
+		if phase, ok := p.MessagePhaseByIndex[outputIndex.Int()]; ok && phase != "" {
+			return phase
+		}
+	}
+	if p.ActiveMessagePhase != "" {
+		return p.ActiveMessagePhase
+	}
+	if p.SawExplicitMessagePhase {
+		return "unphased"
+	}
+	return ""
+}
+
+func codexOutputHasExplicitMessagePhase(response gjson.Result) bool {
+	for _, item := range response.Get("output").Array() {
+		if item.Get("type").String() == "message" && normalizeCodexMessagePhase(item.Get("phase").String()) != "" {
+			return true
+		}
+	}
+	return false
+}
+
 func codexTerminalTextOutput(response gjson.Result) (string, string) {
 	var content strings.Builder
 	var reasoning strings.Builder
+	hasExplicitMessagePhase := codexOutputHasExplicitMessagePhase(response)
 	for _, item := range response.Get("output").Array() {
 		switch item.Get("type").String() {
 		case "message":
+			phase := normalizeCodexMessagePhase(item.Get("phase").String())
+			interim := codexMessagePhaseIsInterim(phase) || (phase == "" && hasExplicitMessagePhase)
 			for _, part := range item.Get("content").Array() {
-				content.WriteString(part.Get("text").String())
+				if interim {
+					reasoning.WriteString(part.Get("text").String())
+				} else {
+					content.WriteString(part.Get("text").String())
+				}
 			}
 		case "reasoning":
 			for _, part := range item.Get("summary").Array() {
@@ -592,6 +691,7 @@ func ConvertCodexResponseToOpenAINonStream(_ context.Context, _ string, original
 		outputArray := outputResult.Array()
 		var contentText string
 		var reasoningText string
+		hasExplicitMessagePhase := codexOutputHasExplicitMessagePhase(responseResult)
 
 		for _, outputItem := range outputArray {
 			outputType := outputItem.Get("type").String()
@@ -622,13 +722,18 @@ func ConvertCodexResponseToOpenAINonStream(_ context.Context, _ string, original
 					}
 				}
 			case "message":
+				phase := normalizeCodexMessagePhase(outputItem.Get("phase").String())
 				// Extract message content
 				if contentResult := outputItem.Get("content"); contentResult.IsArray() {
 					contentArray := contentResult.Array()
 					for _, contentItem := range contentArray {
 						if contentItem.Get("type").String() == "output_text" {
 							if text := contentItem.Get("text").String(); text != "" {
-								contentText += text
+								if codexMessagePhaseIsInterim(phase) || (phase == "" && hasExplicitMessagePhase) {
+									reasoningText += text
+								} else {
+									contentText += text
+								}
 							}
 							break
 						}
