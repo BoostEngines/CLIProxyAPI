@@ -1064,6 +1064,13 @@ func xaiStatusErr(code int, body []byte) statusErr {
 		err.code = http.StatusUnauthorized
 		return err
 	}
+	// This exact provider refusal belongs to the current request. Preserve it,
+	// stop credential rotation, and keep later unrelated requests routable.
+	if code == http.StatusForbidden && gjson.GetBytes(body, "error").Type == gjson.String &&
+		gjson.GetBytes(body, "error").String() == "I'm sorry, I can't help with that request." {
+		err.requestScoped = true
+		return err
+	}
 	if code != http.StatusTooManyRequests {
 		return err
 	}
