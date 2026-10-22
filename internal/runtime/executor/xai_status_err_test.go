@@ -87,3 +87,24 @@ func TestXAIStatusErr_EmptyBodyForbiddenUnchanged(t *testing.T) {
 		t.Fatalf("status = %d, want 403", err.StatusCode())
 	}
 }
+
+func TestXAIStatusErr_CurrentPolicyRefusalIsRequestScoped(t *testing.T) {
+	body := []byte(`{"error":"I'm sorry, I can't help with that request."}`)
+	err := xaiStatusErr(http.StatusForbidden, body)
+	if !err.IsRequestScoped() || err.StatusCode() != http.StatusForbidden || err.Error() != string(body) {
+		t.Fatalf("refusal must preserve the original 403 and body without rotating credentials: %#v", err)
+	}
+	for _, tc := range []struct {
+		status int
+		body   string
+	}{
+		{http.StatusServiceUnavailable, `{"error":"I'm sorry, I can't help with that request."}`},
+		{http.StatusForbidden, `{"error":"model access is not allowed for this account"}`},
+		{http.StatusForbidden, `{"code":"unauthenticated:bad-credentials","error":"I'm sorry, I can't help with that request."}`},
+		{http.StatusForbidden, `{"error":"auth_unavailable; last upstream error: I'm sorry, I can't help with that request."}`},
+	} {
+		if got := xaiStatusErr(tc.status, []byte(tc.body)); got.IsRequestScoped() {
+			t.Fatalf("credential/availability/unknown error must retain existing handling: %#v", got)
+		}
+	}
+}

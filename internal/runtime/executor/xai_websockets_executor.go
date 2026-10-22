@@ -1000,9 +1000,15 @@ func parseXAIWebsocketError(payload []byte) (error, bool) {
 	if wsErr, ok := parseCodexWebsocketError(payload); ok {
 		if statusError, okStatus := wsErr.(statusErrWithHeaders); okStatus {
 			xaiError := xaiStatusErr(statusError.code, payload)
+			if xaiError.code == http.StatusForbidden {
+				// Codex-compatible envelopes may nest the current body under body.error.
+				// Keep raw bad-credentials precedence before reading that normalized body.
+				xaiError.requestScoped = xaiStatusErr(statusError.code, []byte(statusError.msg)).requestScoped
+			}
 			// Apply normalized status (e.g. 403 bad-credentials -> 401) and any
 			// provider-specific retry hint while preserving websocket headers.
 			statusError.code = xaiError.code
+			statusError.requestScoped = xaiError.requestScoped
 			if xaiError.retryAfter != nil {
 				statusError.retryAfter = xaiError.retryAfter
 			}
